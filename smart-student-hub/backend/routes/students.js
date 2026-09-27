@@ -1,28 +1,14 @@
 const express = require('express');
 const multer = require('multer');
-const path = require('path');
-const fsSync = require('fs');
 const { auth, isStudent } = require('../middleware/auth');
 const { getPool } = require('../config/database');
 const jwt = require('jsonwebtoken');
+const { CONTAINERS, uploadBlob, deleteBlob } = require('../services/blobStorage');
 
-// Configure multer for resume uploads
-const resumeStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadPath = path.join(__dirname, '../uploads/resumes');
-    if (!fsSync.existsSync(uploadPath)) {
-      fsSync.mkdirSync(uploadPath, { recursive: true });
-    }
-    cb(null, uploadPath);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, 'resume-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
-
+// Configure multer for resume uploads. Files are kept in memory and sent to Azure Blob Storage
+// by the route handler, so nothing is written to the server's disk.
 const resumeUpload = multer({
-  storage: resumeStorage,
+  storage: multer.memoryStorage(),
   limits: {
     fileSize: 5 * 1024 * 1024 // 5MB limit
   },
@@ -663,6 +649,8 @@ router.get('/portfolio/shared/:token', async (req, res) => {
 
 // Update student profile
 router.put('/profile/:studentId', auth, isStudent, resumeUpload.single('resume'), async (req, res) => {
+  // New resume blob that is not yet saved to the database, removed if the update fails
+  let unsavedResumeUrl = null;
   try {
     const { studentId } = req.params;
     const userId = req.user.userId;
@@ -683,34 +671,29 @@ router.put('/profile/:studentId', auth, isStudent, resumeUpload.single('resume')
 
     // Handle resume upload if present
     let resumeUrl = null;
+    let oldResumeUrl = null;
     if (req.file) {
-      // Get current profile to potentially clean up old resume
+      // Get current profile to clean up the old resume after the update
       const currentProfile = await pool.query(
         'SELECT resume_url FROM students WHERE id = $1',
         [studentId]
       );
-      
-      const oldResumeUrl = currentProfile.rows[0]?.resume_url;
-      resumeUrl = `/uploads/resumes/${req.file.filename}`;
-      
-      // Clean up old resume file if it exists and is different
-      if (oldResumeUrl && oldResumeUrl !== resumeUrl) {
-        const oldFilePath = path.join(__dirname, '..', 'uploads', 'resumes', path.basename(oldResumeUrl));
-        try {
-          const fs = require('fs').promises;
-          await fs.unlink(oldFilePath);
-        } catch (err) {
-          console.warn('Could not delete old resume:', err.message);
-        }
-      }
+
+      oldResumeUrl = currentProfile.rows[0]?.resume_url;
+      resumeUrl = await uploadBlob(CONTAINERS.RESUMES, req.file);
+      unsavedResumeUrl = resumeUrl;
     }
 
-    // Start transaction
-    await pool.query('BEGIN');
+    // Run the transaction on one dedicated client so BEGIN, the updates and COMMIT/ROLLBACK
+    // share a connection (pool.query may use a different connection for each call)
+    const client = await pool.connect();
 
     try {
+      // Start transaction
+      await client.query('BEGIN');
+
       // Update user basic info
-      await pool.query(`
+      await client.query(`
         UPDATE users 
         SET first_name = $1, last_name = $2, phone = $3, updated_at = CURRENT_TIMESTAMP
         WHERE id = $4
@@ -741,23 +724,35 @@ router.put('/profile/:studentId', auth, isStudent, resumeUpload.single('resume')
         updateParams = [description, techStack, skills, interests, careerGoals, linkedinUrl, githubUrl, portfolioUrl, studentId];
       }
 
-      await pool.query(updateQuery, updateParams);
+      await client.query(updateQuery, updateParams);
 
       // Commit transaction
-      await pool.query('COMMIT');
-
-      res.json({
-        message: 'Profile updated successfully'
-      });
-
+      await client.query('COMMIT');
     } catch (error) {
-      // Rollback transaction
-      await pool.query('ROLLBACK');
+      // Rollback transaction. A failed rollback is logged so it does not hide the original error.
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        console.error('Profile update rollback error:', rollbackError);
+      }
       throw error;
+    } finally {
+      client.release();
     }
+    unsavedResumeUrl = null;
+
+    // Remove the replaced resume only once the new URL is committed
+    if (oldResumeUrl && oldResumeUrl !== resumeUrl) {
+      await deleteBlob(oldResumeUrl);
+    }
+
+    res.json({
+      message: 'Profile updated successfully'
+    });
 
   } catch (error) {
     console.error('Profile update error:', error);
+    await deleteBlob(unsavedResumeUrl);
     res.status(500).json({
       message: 'Internal server error while updating profile'
     });
@@ -765,26 +760,15 @@ router.put('/profile/:studentId', auth, isStudent, resumeUpload.single('resume')
 });
 
 // Complete student profile after registration
-router.post('/complete-profile', resumeUpload.single('resume'), async (req, res) => {
+router.post('/complete-profile', auth, isStudent, resumeUpload.single('resume'), async (req, res) => {
+  // New resume blob that is not yet saved to the database, removed if the update fails
+  let unsavedResumeUrl = null;
   try {
-    const { description, techStack, skills, interests, careerGoals, linkedinUrl, githubUrl, portfolioUrl, email } = req.body;
+    const { description, techStack, skills, interests, careerGoals, linkedinUrl, githubUrl, portfolioUrl } = req.body;
+    const userId = req.user.userId;
     const pool = getPool();
 
-    // Find the student by email (temporary solution for profile completion)
-    const userResult = await pool.query(
-      'SELECT id FROM users WHERE email = $1',
-      [email]
-    );
-
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({
-        message: 'User not found'
-      });
-    }
-
-    const userId = userResult.rows[0].id;
-
-    // Find the student record
+    // Find the student record of the signed-in user (any email in the body is ignored)
     const studentResult = await pool.query(
       'SELECT id FROM students WHERE user_id = $1',
       [userId]
@@ -801,7 +785,8 @@ router.post('/complete-profile', resumeUpload.single('resume'), async (req, res)
     // Handle resume upload if present
     let resumeUrl = null;
     if (req.file) {
-      resumeUrl = `/uploads/resumes/${req.file.filename}`;
+      resumeUrl = await uploadBlob(CONTAINERS.RESUMES, req.file);
+      unsavedResumeUrl = resumeUrl;
     }
 
     // Update student profile
@@ -813,6 +798,7 @@ router.post('/complete-profile', resumeUpload.single('resume'), async (req, res)
       WHERE id = $10
       RETURNING *
     `, [description, techStack, skills, interests, careerGoals, linkedinUrl, githubUrl, portfolioUrl, resumeUrl, studentId]);
+    unsavedResumeUrl = null;
 
     res.json({
       message: 'Profile completed successfully',
@@ -821,6 +807,7 @@ router.post('/complete-profile', resumeUpload.single('resume'), async (req, res)
 
   } catch (error) {
     console.error('Profile completion error:', error);
+    await deleteBlob(unsavedResumeUrl);
     res.status(500).json({
       message: 'Internal server error while completing profile'
     });

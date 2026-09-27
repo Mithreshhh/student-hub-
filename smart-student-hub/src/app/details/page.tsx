@@ -119,8 +119,12 @@ export default function StudentDetailsPage() {
         submitData.append('resume', formData.resume)
       }
 
+      const token = localStorage.getItem('token')
       const response = await fetch(apiUrl('/api/students/complete-profile'), {
         method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+        },
         body: submitData,
       })
 

@@ -26,9 +26,8 @@ Unified platform for managing student activities, faculty approvals, analytics, 
 │     ├─ server.js             Entry point
 │     ├─ config/database.js    Pool config and schema bootstrap
 │     ├─ routes/               API route handlers
-│     ├─ services/             Built-in sheets service
-│     ├─ middleware/           Auth middleware
-│     └─ uploads/              Uploaded files (created at runtime, git-ignored)
+│     ├─ services/             Built-in sheets and Azure Blob Storage services
+│     └─ middleware/           Auth middleware
 └─ README.md
 ```
 
@@ -131,7 +130,7 @@ The credentials are defined in `smart-student-hub/backend/config/database.js`. C
 
 All other accounts (admins, faculty, students, recruiters) are created from the app.
 
-Uploaded certificates are stored on local disk in `backend/uploads/`. On hosts with an ephemeral filesystem (Render, Railway, Heroku), attach a persistent disk mounted at that path or uploads will be lost on redeploy.
+Uploaded resumes, certificates and activity images are stored in Azure Blob Storage (containers `resumes`, `certificates`, `activity-images`), and PostgreSQL stores each file's Blob URL. Set `AZURE_STORAGE_ACCOUNT_NAME` in `backend/.env`. The API authenticates with `DefaultAzureCredential` (`az login` locally, Managed Identity in Azure), and that identity needs the Storage Blob Data Contributor role on the account.
 
 On a VM, run the API under PM2 behind nginx with HTTPS:
 

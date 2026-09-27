@@ -1,35 +1,18 @@
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs').promises;
-const fsSync = require('fs');
 const { auth, isStudent, isFaculty } = require('../middleware/auth');
 const { getPool } = require('../config/database');
 const { getActivityDataForWebhook } = require('./webhook');
 const builtinSheetsService = require('../services/builtinSheets');
+const { CONTAINERS, uploadBlob, deleteBlob, deleteBlobs } = require('../services/blobStorage');
 
 const router = express.Router();
 
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    // Save certificates and images in different subfolders
-    const isImage = /image\/(jpeg|jpg|png)/.test(file.mimetype);
-    const subfolder = isImage && file.fieldname === 'image' ? 'activity-images' : 'certificates';
-    const uploadPath = path.join(__dirname, `../uploads/${subfolder}`);
-    if (!fsSync.existsSync(uploadPath)) {
-      fsSync.mkdirSync(uploadPath, { recursive: true });
-    }
-    cb(null, uploadPath);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
-
+// Configure multer for file uploads. Files are kept in memory and sent to Azure Blob Storage
+// by the route handler, so nothing is written to the server's disk.
 const upload = multer({
-  storage: storage,
+  storage: multer.memoryStorage(),
   limits: {
     fileSize: parseInt(process.env.MAX_FILE_SIZE) || 10 * 1024 * 1024 // 10MB default
   },
@@ -51,6 +34,8 @@ router.post('/upload', auth, isStudent, upload.fields([
   { name: 'certificate', maxCount: 1 },
   { name: 'image', maxCount: 1 }
 ]), async (req, res) => {
+  // Blobs uploaded by this request, removed again if the activity is not saved
+  const uploadedBlobUrls = [];
   try {
     const userId = req.user.userId;
     const {
@@ -86,14 +71,16 @@ router.post('/upload', auth, isStudent, upload.fields([
 
     const studentId = studentResult.rows[0].id;
 
-    // Prepare file URLs
+    // Upload files to Blob Storage and keep their URLs
     let certificateUrl = null;
     let imageUrl = null;
     if (req.files && req.files['certificate'] && req.files['certificate'][0]) {
-      certificateUrl = `/uploads/certificates/${req.files['certificate'][0].filename}`;
+      certificateUrl = await uploadBlob(CONTAINERS.CERTIFICATES, req.files['certificate'][0]);
+      uploadedBlobUrls.push(certificateUrl);
     }
     if (req.files && req.files['image'] && req.files['image'][0]) {
-      imageUrl = `/uploads/activity-images/${req.files['image'][0].filename}`;
+      imageUrl = await uploadBlob(CONTAINERS.ACTIVITY_IMAGES, req.files['image'][0]);
+      uploadedBlobUrls.push(imageUrl);
     }
 
     // Insert activity
@@ -116,15 +103,8 @@ router.post('/upload', auth, isStudent, upload.fields([
   } catch (error) {
     console.error('Activity upload error:', error);
     
-    // Clean up uploaded files if database insert failed
-    if (req.files) {
-      const allFiles = [...(req.files['certificate'] || []), ...(req.files['image'] || [])];
-      allFiles.forEach((f) => {
-        fs.unlink(f.path, (err) => {
-          if (err) console.error('Error deleting uploaded file:', err);
-        });
-      })
-    }
+    // Clean up uploaded blobs if the database insert failed
+    await deleteBlobs(uploadedBlobUrls);
 
     res.status(500).json({
       message: 'Internal server error while uploading activity'
@@ -368,6 +348,8 @@ router.get('/:id', auth, async (req, res) => {
 
 // Update activity (student only)
 router.put('/:id', auth, isStudent, upload.single('certificate'), async (req, res) => {
+  // New certificate blob that is not yet saved to the database, removed if the update fails
+  let unsavedCertificateUrl = null;
   try {
     const { id } = req.params;
     const userId = req.user.userId;
@@ -409,27 +391,19 @@ router.put('/:id', auth, isStudent, upload.single('certificate'), async (req, re
 
     // Handle certificate update if new file is provided
     let certificateUrl = null;
+    let oldCertificateUrl = null;
     if (req.file) {
-      // Get current activity to potentially clean up old certificate
+      // Get current activity to clean up the old certificate after the update
       const currentActivity = await pool.query(
         'SELECT certificate_url FROM activities WHERE id = $1',
         [id]
       );
-      
-      const oldCertificateUrl = currentActivity.rows[0]?.certificate_url;
-      
-      // Set new certificate URL
-      certificateUrl = `/uploads/${req.file.filename}`;
-      
-      // Clean up old certificate file if it exists and is different
-      if (oldCertificateUrl && oldCertificateUrl !== certificateUrl) {
-        const oldFilePath = path.join(__dirname, '..', 'uploads', path.basename(oldCertificateUrl));
-        try {
-          await fs.unlink(oldFilePath);
-        } catch (err) {
-          console.warn('Could not delete old certificate:', err.message);
-        }
-      }
+
+      oldCertificateUrl = currentActivity.rows[0]?.certificate_url;
+
+      // Upload new certificate
+      certificateUrl = await uploadBlob(CONTAINERS.CERTIFICATES, req.file);
+      unsavedCertificateUrl = certificateUrl;
     }
 
     // Update activity (with or without certificate)
@@ -458,6 +432,12 @@ router.put('/:id', auth, isStudent, upload.single('certificate'), async (req, re
     }
 
     const result = await pool.query(updateQuery, updateParams);
+    unsavedCertificateUrl = null;
+
+    // Remove the replaced certificate only once the new URL is saved
+    if (oldCertificateUrl && oldCertificateUrl !== certificateUrl) {
+      await deleteBlob(oldCertificateUrl);
+    }
 
     res.json({
       message: 'Activity updated successfully',
@@ -466,6 +446,7 @@ router.put('/:id', auth, isStudent, upload.single('certificate'), async (req, re
 
   } catch (error) {
     console.error('Activity update error:', error);
+    await deleteBlob(unsavedCertificateUrl);
     res.status(500).json({
       message: 'Internal server error while updating activity'
     });
@@ -495,7 +476,7 @@ router.delete('/:id', auth, isStudent, async (req, res) => {
 
     // Check if activity exists and belongs to student
     const activityResult = await pool.query(
-      'SELECT id, status, certificate_url FROM activities WHERE id = $1 AND student_id = $2',
+      'SELECT id, status, certificate_url, image_url FROM activities WHERE id = $1 AND student_id = $2',
       [id, studentId]
     );
 
@@ -515,13 +496,8 @@ router.delete('/:id', auth, isStudent, async (req, res) => {
     // Delete activity
     await pool.query('DELETE FROM activities WHERE id = $1 AND student_id = $2', [id, studentId]);
 
-    // Delete certificate file if exists
-    if (activityResult.rows[0].certificate_url) {
-      const filePath = path.join(__dirname, '..', activityResult.rows[0].certificate_url);
-      fs.unlink(filePath, (err) => {
-        if (err) console.error('Error deleting certificate file:', err);
-      });
-    }
+    // Delete certificate and image blobs if they exist
+    await deleteBlobs([activityResult.rows[0].certificate_url, activityResult.rows[0].image_url]);
 
     res.json({
       message: 'Activity deleted successfully'

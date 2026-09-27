@@ -1,8 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
-const path = require('path');
 const { getPool, closePool, testConnection, initializeDatabase } = require('./config/database');
+const { verifyBlobStorageConfig } = require('./services/blobStorage');
 
 // Load environment variables
 dotenv.config({ quiet: true });
@@ -12,7 +12,7 @@ const isProduction = process.env.NODE_ENV === 'production';
 // Fail fast on missing configuration instead of running with insecure defaults
 const requiredEnv = ['JWT_SECRET'];
 if (isProduction) {
-  requiredEnv.push('FRONTEND_URL');
+  requiredEnv.push('FRONTEND_URL', 'AZURE_STORAGE_ACCOUNT_NAME');
   if (!process.env.DATABASE_URL) requiredEnv.push('DB_HOST', 'DB_NAME', 'DB_USER', 'DB_PASSWORD');
 }
 const missingEnv = requiredEnv.filter((key) => !process.env[key]);
@@ -62,9 +62,6 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
-
-// Serve static files
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Routes
 app.get('/', (req, res) => {
@@ -139,6 +136,9 @@ const startServer = async () => {
     console.log(`🚀 Server running on port ${PORT} (${process.env.NODE_ENV || 'development'})`);
     console.log(`🌐 Allowed origins: ${isProduction ? allowedOrigins.join(', ') : 'all (development)'}`);
   });
+
+  // Report Blob Storage problems early; uploads fail with the same message until they are fixed
+  verifyBlobStorageConfig();
 
   const shutdown = (signal) => {
     console.log(`${signal} received, shutting down gracefully`);

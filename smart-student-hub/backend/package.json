@@ -11,6 +11,8 @@
   "license": "ISC",
   "description": "A comprehensive Node.js/Express backend API for the Smart Student Hub platform, providing centralized student achievement management.",
   "dependencies": {
+    "@azure/identity": "^4.13.3",
+    "@azure/storage-blob": "^12.34.0",
     "bcryptjs": "^3.0.2",
     "cors": "^2.8.5",
     "dotenv": "^17.2.2",
